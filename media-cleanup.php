@@ -4,7 +4,7 @@
  * Plugin URI:        https://example.com/media-cleanup
  * Description:       Find and remove unused media files from your WordPress media library. Deep-scans post content, meta fields, widgets, options, and more.
  * Version:           1.1.0
- * Author:            JE Media Cleanup
+ * Author:            Dragan Gurinovic
  * Author URI:        https://example.com
  * License:           GPL-2.0+
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
