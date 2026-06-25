@@ -49,7 +49,9 @@ class Scanner {
             $this->scan_post_meta(),
             $this->scan_options(),
             $this->scan_widgets(),
-            $this->scan_term_meta()
+            $this->scan_term_meta(),
+            $this->scan_theme_css(),
+            $this->scan_page_builders()
         );
 
         return array_unique( array_filter( array_map( 'intval', $used ) ) );
@@ -473,6 +475,238 @@ class Scanner {
         }
 
         return $orphans;
+    }
+
+    /**
+     * Scan theme and child theme CSS files for background-image references.
+     *
+     * @return int[]
+     */
+    public function scan_theme_css(): array {
+        $used_ids    = array();
+        $uploads_url = $this->get_uploads_base_url();
+
+        $stylesheets = array();
+
+        // Active theme stylesheet.
+        $theme_dir = get_stylesheet_directory();
+        $stylesheets[] = $theme_dir . '/style.css';
+
+        // Parent theme if child theme is active.
+        $parent_dir = get_template_directory();
+        if ( $parent_dir !== $theme_dir ) {
+            $stylesheets[] = $parent_dir . '/style.css';
+        }
+
+        // Find all CSS files in both theme directories.
+        $dirs_to_scan = array_unique( array( $theme_dir, $parent_dir ) );
+        foreach ( $dirs_to_scan as $dir ) {
+            if ( ! is_dir( $dir ) ) {
+                continue;
+            }
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator( $dir, \FilesystemIterator::SKIP_DOTS ),
+                \RecursiveIteratorIterator::LEAVES_ONLY
+            );
+            foreach ( $iterator as $file ) {
+                if ( $file->isFile() && 'css' === strtolower( pathinfo( $file->getFilename(), PATHINFO_EXTENSION ) ) ) {
+                    $path = $file->getPathname();
+                    if ( ! in_array( $path, $stylesheets, true ) ) {
+                        $stylesheets[] = $path;
+                    }
+                }
+            }
+        }
+
+        foreach ( $stylesheets as $css_file ) {
+            if ( ! file_exists( $css_file ) || ! is_readable( $css_file ) ) {
+                continue;
+            }
+
+            $content = file_get_contents( $css_file );
+            if ( empty( $content ) ) {
+                continue;
+            }
+
+            // Extract URLs from background-image, background, url(), etc.
+            if ( preg_match_all( '/url\s*\(\s*["\']?([^"\')\s]+)["\']?\s*\)/i', $content, $matches ) ) {
+                foreach ( $matches[1] as $url ) {
+                    // Skip data URIs and external URLs.
+                    if ( 0 === strpos( $url, 'data:' ) || 0 === strpos( $url, '#' ) ) {
+                        continue;
+                    }
+
+                    // Resolve relative URLs against the theme directory.
+                    if ( false === strpos( $url, '://' ) ) {
+                        $css_dir_url = '';
+                        if ( 0 === strpos( $css_file, $theme_dir ) ) {
+                            $css_dir_url = get_stylesheet_directory_uri() . '/' . dirname( str_replace( $theme_dir . '/', '', $css_file ) );
+                        } elseif ( 0 === strpos( $css_file, $parent_dir ) ) {
+                            $css_dir_url = get_template_directory_uri() . '/' . dirname( str_replace( $parent_dir . '/', '', $css_file ) );
+                        }
+                        if ( $css_dir_url ) {
+                            $url = $css_dir_url . '/' . $url;
+                        }
+                    }
+
+                    if ( false !== strpos( $url, $uploads_url ) ) {
+                        $clean_url = preg_replace( '/-\d+x\d+(?=\.\w+$)/', '', $url );
+                        $id = $this->url_to_attachment_id( $clean_url );
+                        if ( ! $id ) {
+                            $id = $this->url_to_attachment_id( $url );
+                        }
+                        if ( $id ) {
+                            $used_ids[] = $id;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also scan theme CSS stored in the customizer (Additional CSS).
+        $custom_css = wp_get_custom_css();
+        if ( ! empty( $custom_css ) ) {
+            $found = $this->extract_attachment_ids_from_content( $custom_css, $uploads_url );
+            if ( ! empty( $found ) ) {
+                array_push( $used_ids, ...$found );
+            }
+
+            if ( preg_match_all( '/url\s*\(\s*["\']?([^"\')\s]+)["\']?\s*\)/i', $custom_css, $matches ) ) {
+                foreach ( $matches[1] as $url ) {
+                    if ( 0 === strpos( $url, 'data:' ) ) {
+                        continue;
+                    }
+                    if ( false !== strpos( $url, $uploads_url ) ) {
+                        $id = $this->url_to_attachment_id( preg_replace( '/-\d+x\d+(?=\.\w+$)/', '', $url ) );
+                        if ( ! $id ) {
+                            $id = $this->url_to_attachment_id( $url );
+                        }
+                        if ( $id ) {
+                            $used_ids[] = $id;
+                        }
+                    }
+                }
+            }
+        }
+
+        return $used_ids;
+    }
+
+    /**
+     * Deep scan page builder data (Elementor, Beaver Builder, Divi, WPBakery).
+     *
+     * @return int[]
+     */
+    public function scan_page_builders(): array {
+        global $wpdb;
+
+        $used_ids    = array();
+        $uploads_url = $this->get_uploads_base_url();
+
+        // Elementor: stores data in _elementor_data postmeta as JSON.
+        $elementor_rows = $wpdb->get_results(
+            "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+             WHERE meta_key = '_elementor_data' AND meta_value != ''"
+        );
+
+        foreach ( $elementor_rows as $row ) {
+            if ( empty( $row->meta_value ) ) {
+                continue;
+            }
+
+            // Extract IDs from Elementor JSON: "id":123 patterns and image URLs.
+            if ( preg_match_all( '/"(?:id|image_id|attach_id|attachment_id)":\s*"?(\d+)"?/i', $row->meta_value, $matches ) ) {
+                $used_ids = array_merge( $used_ids, array_map( 'intval', $matches[1] ) );
+            }
+
+            // URL references in Elementor data.
+            $found = $this->extract_attachment_ids_from_content( $row->meta_value, $uploads_url );
+            if ( ! empty( $found ) ) {
+                array_push( $used_ids, ...$found );
+            }
+        }
+
+        // Elementor CSS print method stores references.
+        $elementor_css_ids = $wpdb->get_col(
+            "SELECT DISTINCT meta_value FROM {$wpdb->postmeta}
+             WHERE meta_key = '_elementor_css' AND meta_value != ''"
+        );
+        foreach ( $elementor_css_ids as $css_data ) {
+            $found = $this->extract_attachment_ids_from_content( $css_data, $uploads_url );
+            if ( ! empty( $found ) ) {
+                array_push( $used_ids, ...$found );
+            }
+        }
+
+        // Beaver Builder: stores data in _fl_builder_data and _fl_builder_draft postmeta.
+        $bb_meta_keys = array( '_fl_builder_data', '_fl_builder_draft' );
+        foreach ( $bb_meta_keys as $meta_key ) {
+            $bb_rows = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT meta_value FROM {$wpdb->postmeta}
+                     WHERE meta_key = %s AND meta_value != ''",
+                    $meta_key
+                )
+            );
+
+            foreach ( $bb_rows as $row ) {
+                $data = maybe_unserialize( $row->meta_value );
+                if ( ! is_array( $data ) ) {
+                    continue;
+                }
+                $serialized = maybe_serialize( $data );
+                $found = $this->extract_attachment_ids_from_content( $serialized, $uploads_url );
+                if ( ! empty( $found ) ) {
+                    array_push( $used_ids, ...$found );
+                }
+
+                // Walk the array for photo/image keys.
+                array_walk_recursive(
+                    $data,
+                    function ( $value, $key ) use ( &$used_ids ) {
+                        if ( is_numeric( $value ) && (int) $value > 0 ) {
+                            $key_lower = strtolower( (string) $key );
+                            if ( in_array( $key_lower, array( 'photo', 'photo_id', 'image', 'image_id', 'id', 'attachment_id', 'bg_image', 'bg_video' ), true ) ) {
+                                $used_ids[] = (int) $value;
+                            }
+                        }
+                    }
+                );
+            }
+        }
+
+        // Divi / ET Builder: stores shortcode data in post_content (already scanned),
+        // but also stores global modules in et_pb_* options.
+        $divi_options = $wpdb->get_results(
+            "SELECT option_value FROM {$wpdb->options}
+             WHERE option_name LIKE 'et_pb_%' AND option_value != ''"
+        );
+        foreach ( $divi_options as $row ) {
+            $found = $this->extract_attachment_ids_from_content( $row->option_value, $uploads_url );
+            if ( ! empty( $found ) ) {
+                array_push( $used_ids, ...$found );
+            }
+        }
+
+        // WPBakery: uses shortcodes in post_content (already scanned),
+        // but also check for image= and images= attributes.
+        $wpbakery_rows = $wpdb->get_results(
+            "SELECT post_content FROM {$wpdb->posts}
+             WHERE post_type != 'attachment'
+               AND post_type != 'revision'
+               AND post_content LIKE '%[vc_%'"
+        );
+        foreach ( $wpbakery_rows as $row ) {
+            // [vc_single_image image="123"], [vc_gallery images="1,2,3"]
+            if ( preg_match_all( '/\[vc_[^\]]*\s(?:image|images)=["\']([^"\']+)["\']/i', $row->post_content, $matches ) ) {
+                foreach ( $matches[1] as $val ) {
+                    $ids = array_filter( array_map( 'intval', explode( ',', $val ) ) );
+                    $used_ids = array_merge( $used_ids, $ids );
+                }
+            }
+        }
+
+        return $used_ids;
     }
 
     /**

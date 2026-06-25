@@ -24,18 +24,19 @@ final class Plugin {
     private static ?self $instance = null;
 
     /**
-     * Admin page handler.
-     *
      * @var Admin_Page
      */
     private Admin_Page $admin_page;
 
     /**
-     * AJAX handler.
-     *
      * @var Ajax_Handler
      */
     private Ajax_Handler $ajax_handler;
+
+    /**
+     * @var Scheduler
+     */
+    private Scheduler $scheduler;
 
     /**
      * Get (or create) the singleton instance.
@@ -55,6 +56,7 @@ final class Plugin {
     private function __construct() {
         $this->admin_page   = new Admin_Page();
         $this->ajax_handler = new Ajax_Handler();
+        $this->scheduler    = new Scheduler();
     }
 
     /**
@@ -81,5 +83,8 @@ final class Plugin {
         }
         delete_transient( 'jemc_scan_results' );
         delete_transient( 'jemc_orphan_results' );
+        delete_transient( 'jemc_duplicates_results' );
+        delete_transient( 'jemc_broken_links_results' );
+        wp_unschedule_hook( Scheduler::CRON_HOOK );
     }
 }

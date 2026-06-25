@@ -45,6 +45,16 @@ class Ajax_Handler {
             'jemc_scan_orphan_thumbnails',
             'jemc_delete_orphan_thumbnails',
             'jemc_export_csv',
+            'jemc_scan_duplicates',
+            'jemc_scan_broken_links',
+            'jemc_quarantine_media',
+            'jemc_get_quarantine',
+            'jemc_restore_quarantine',
+            'jemc_delete_quarantine',
+            'jemc_scan_optimizable',
+            'jemc_optimize_images',
+            'jemc_get_schedule',
+            'jemc_save_schedule',
         );
 
         foreach ( $actions as $action ) {
@@ -91,6 +101,8 @@ class Ajax_Handler {
                     'options',
                     'widgets',
                     'term_meta',
+                    'theme_css',
+                    'page_builders',
                     'finalize',
                 ),
             ),
@@ -100,7 +112,7 @@ class Ajax_Handler {
         wp_send_json_success(
             array(
                 'total'      => count( $all_ids ),
-                'totalSteps' => 6,
+                'totalSteps' => 8,
             )
         );
     }
@@ -152,6 +164,12 @@ class Ajax_Handler {
                 break;
             case 'term_meta':
                 $new_ids = $this->scanner->scan_term_meta();
+                break;
+            case 'theme_css':
+                $new_ids = $this->scanner->scan_theme_css();
+                break;
+            case 'page_builders':
+                $new_ids = $this->scanner->scan_page_builders();
                 break;
             case 'finalize':
                 // Calculate unused IDs and store results.
@@ -438,6 +456,253 @@ class Ajax_Handler {
         }
 
         wp_send_json_success( array( 'csv' => $rows ) );
+    }
+
+    /**
+     * Scan for duplicate media files.
+     *
+     * @return void
+     */
+    public function jemc_scan_duplicates(): void {
+        $this->verify_request();
+
+        $duplicates = new Duplicates();
+        $groups     = $duplicates->find_duplicates();
+        $summary    = $duplicates->get_summary( $groups );
+
+        set_transient( 'jemc_duplicates_results', $groups, DAY_IN_SECONDS );
+
+        wp_send_json_success(
+            array(
+                'groups'  => $groups,
+                'summary' => $summary,
+            )
+        );
+    }
+
+    /**
+     * Scan for broken media links.
+     *
+     * @return void
+     */
+    public function jemc_scan_broken_links(): void {
+        $this->verify_request();
+
+        $broken  = new Broken_Links();
+        $results = $broken->find_broken_links();
+
+        wp_send_json_success(
+            array(
+                'links' => $results,
+                'total' => count( $results ),
+            )
+        );
+    }
+
+    /**
+     * Move media to quarantine.
+     *
+     * @return void
+     */
+    public function jemc_quarantine_media(): void {
+        $this->verify_request();
+
+        $ids = array();
+        if ( isset( $_POST['ids'] ) && is_array( $_POST['ids'] ) ) {
+            $ids = array_map( 'intval', $_POST['ids'] );
+        }
+
+        if ( empty( $ids ) ) {
+            wp_send_json_error( array( 'message' => 'No items selected.' ) );
+        }
+
+        $quarantine = new Quarantine();
+        $result     = $quarantine->quarantine_attachments( $ids );
+
+        // Update cached scan results.
+        $cached = get_transient( 'jemc_scan_results' );
+        if ( false !== $cached && is_array( $cached ) ) {
+            $cached['unused_ids'] = array_values( array_diff( $cached['unused_ids'], $ids ) );
+            $total_size = 0;
+            foreach ( $cached['unused_ids'] as $id ) {
+                $file_path = get_attached_file( $id );
+                if ( $file_path && file_exists( $file_path ) ) {
+                    $size = filesize( $file_path );
+                    if ( $size ) {
+                        $total_size += $size;
+                    }
+                }
+            }
+            $cached['total_size'] = $total_size;
+            set_transient( 'jemc_scan_results', $cached, DAY_IN_SECONDS );
+        }
+
+        wp_send_json_success( $result );
+    }
+
+    /**
+     * Get quarantined items.
+     *
+     * @return void
+     */
+    public function jemc_get_quarantine(): void {
+        $this->verify_request();
+
+        $quarantine = new Quarantine();
+        $items      = $quarantine->get_items();
+        $summary    = $quarantine->get_summary();
+
+        wp_send_json_success(
+            array(
+                'items'   => $items,
+                'summary' => $summary,
+            )
+        );
+    }
+
+    /**
+     * Restore quarantined items.
+     *
+     * @return void
+     */
+    public function jemc_restore_quarantine(): void {
+        $this->verify_request();
+
+        $keys = array();
+        if ( isset( $_POST['keys'] ) && is_array( $_POST['keys'] ) ) {
+            $keys = array_map( 'sanitize_text_field', $_POST['keys'] );
+        }
+
+        if ( empty( $keys ) ) {
+            wp_send_json_error( array( 'message' => 'No items selected.' ) );
+        }
+
+        $quarantine = new Quarantine();
+        $restored   = 0;
+        $failed     = 0;
+        $errors     = array();
+
+        foreach ( $keys as $key ) {
+            $result = $quarantine->restore_item( $key );
+            $restored += $result['restored'];
+            $failed   += $result['failed'];
+            $errors    = array_merge( $errors, $result['errors'] );
+        }
+
+        wp_send_json_success(
+            array(
+                'restored' => $restored,
+                'failed'   => $failed,
+                'errors'   => $errors,
+            )
+        );
+    }
+
+    /**
+     * Permanently delete quarantined items.
+     *
+     * @return void
+     */
+    public function jemc_delete_quarantine(): void {
+        $this->verify_request();
+
+        $keys = array();
+        if ( isset( $_POST['keys'] ) && is_array( $_POST['keys'] ) ) {
+            $keys = array_map( 'sanitize_text_field', $_POST['keys'] );
+        }
+
+        if ( empty( $keys ) ) {
+            wp_send_json_error( array( 'message' => 'No items selected.' ) );
+        }
+
+        $quarantine = new Quarantine();
+        $result     = $quarantine->delete_permanently( $keys );
+
+        wp_send_json_success( $result );
+    }
+
+    /**
+     * Scan for optimizable images.
+     *
+     * @return void
+     */
+    public function jemc_scan_optimizable(): void {
+        $this->verify_request();
+
+        $optimizer = new Optimizer();
+        $results   = $optimizer->find_optimizable();
+
+        $total_potential = 0;
+        foreach ( $results as $item ) {
+            $total_potential += $item['potential_savings'];
+        }
+
+        wp_send_json_success(
+            array(
+                'items'          => $results,
+                'total'          => count( $results ),
+                'totalPotential' => size_format( $total_potential ),
+                'totalPotentialRaw' => $total_potential,
+            )
+        );
+    }
+
+    /**
+     * Optimize selected images.
+     *
+     * @return void
+     */
+    public function jemc_optimize_images(): void {
+        $this->verify_request();
+
+        $ids = array();
+        if ( isset( $_POST['ids'] ) && is_array( $_POST['ids'] ) ) {
+            $ids = array_map( 'intval', $_POST['ids'] );
+        }
+
+        $max_dim    = isset( $_POST['max_dimension'] ) ? max( 100, (int) $_POST['max_dimension'] ) : 2560;
+        $strip_exif = ! isset( $_POST['strip_exif'] ) || ! empty( $_POST['strip_exif'] );
+
+        if ( empty( $ids ) ) {
+            wp_send_json_error( array( 'message' => 'No items selected.' ) );
+        }
+
+        $optimizer = new Optimizer();
+        $result    = $optimizer->batch_optimize( $ids, $max_dim, $strip_exif );
+
+        wp_send_json_success( $result );
+    }
+
+    /**
+     * Get schedule settings.
+     *
+     * @return void
+     */
+    public function jemc_get_schedule(): void {
+        $this->verify_request();
+
+        $scheduler = new Scheduler();
+        wp_send_json_success( $scheduler->get_settings() );
+    }
+
+    /**
+     * Save schedule settings.
+     *
+     * @return void
+     */
+    public function jemc_save_schedule(): void {
+        $this->verify_request();
+
+        $settings = array(
+            'enabled'   => ! empty( $_POST['enabled'] ),
+            'frequency' => sanitize_text_field( $_POST['frequency'] ?? 'weekly' ),
+            'email'     => sanitize_email( $_POST['email'] ?? '' ),
+        );
+
+        $scheduler = new Scheduler();
+        $scheduler->update_settings( $settings );
+
+        wp_send_json_success( $scheduler->get_settings() );
     }
 
     /**
